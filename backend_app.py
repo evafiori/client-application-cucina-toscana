@@ -142,6 +142,31 @@ def run_raw_select(full_query: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def _run_full_select_simplificata(full_query: str) -> List[Dict[str, Any]]:
+    """
+    Come run_raw_select, ma con la stessa semplificazione dei valori usata da
+    run_select (URI del namespace locale ridotti al local name). Pensata per
+    query che includono già tutti i propri PREFIX (es. le query federate
+    verso DBpedia/Wikidata), quindi NON aggiunge i PREFIXES globali per
+    evitare dichiarazioni duplicate o in conflitto.
+    """
+    sparql = _make_wrapper(QUERY_ENDPOINT, GET)
+    sparql.setQuery(full_query)
+    results = sparql.query().convert()
+    rows = []
+    for binding in results["results"]["bindings"]:
+        row = {}
+        for var, val in binding.items():
+            value = val["value"]
+            if val["type"] == "uri":
+                row[var] = local_name(value) if value.startswith(BASE_NS) else value
+                row[var + "_uri"] = value
+            else:
+                row[var] = value
+        rows.append(row)
+    return rows
+
+
 def _esc(s: str) -> str:
     """Escape minimo per inserire stringhe letterali in query SPARQL."""
     return s.replace("\\", "\\\\").replace('"', '\\"')
@@ -507,6 +532,138 @@ def elimina_tripla(soggetto: str, predicato: str, oggetto: str, oggetto_e_letter
     obj = f'"{_esc(oggetto)}"' if oggetto_e_letterale else f":{oggetto}"
     update = f"DELETE DATA {{ :{soggetto} :{predicato} {obj} . }}"
     return run_update(update)
+
+
+# --------------------------------------------------------------------------
+# QUERY FEDERATE VERSO DBPEDIA (arricchimento dati esterni)
+# --------------------------------------------------------------------------
+#
+# Le tre funzioni seguenti eseguono query SPARQL 1.1 federate (clausola
+# SERVICE) che vengono valutate interamente da GraphDB: la parte locale
+# seleziona i piatti/ingredienti dell'ontologia, la parte SERVICE delega
+# l'interrogazione a https://dbpedia.org/sparql per recuperare descrizioni,
+# immagini, link a Wikipedia e luoghi di origine.
+#
+# NOTA: ogni query include già tutti i propri PREFIX, quindi viene eseguita
+# tramite _run_full_select_simplificata (che non prepende i PREFIXES globali,
+# per evitare dichiarazioni duplicate). Richiede che GraphDB abbia accesso
+# di rete in uscita verso dbpedia.org.
+
+def get_descrizione_piatti_dbpedia() -> List[Dict[str, Any]]:
+    """
+    Query federata 1: per ciascun Piatto locale (e relative sottoclassi),
+    cerca su DBpedia una risorsa di tipo dbo:Food originaria della Toscana
+    (dbo:region dbr:Tuscany) il cui URI contenga il nome del piatto, e ne
+    recupera la descrizione/abstract in italiano.
+    """
+    query = f"""
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX : <{BASE_NS}>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX dbo: <http://dbpedia.org/ontology/>
+    PREFIX dct: <http://purl.org/dc/terms/>
+    PREFIX dbc: <http://dbpedia.org/resource/Category:>
+    PREFIX dbr: <http://dbpedia.org/resource/>
+
+    SELECT DISTINCT ?piattoLocale ?risorsaDBpedia ?descrizione WHERE {{
+        ?piattoLocale a/rdfs:subClassOf* :Piatto .
+
+        BIND(STRAFTER(STR(?piattoLocale), "Progetto-WebSem-EE/") AS ?nomeFrammento)
+
+        SERVICE <https://dbpedia.org/sparql> {{
+            ?risorsaDBpedia rdf:type dbo:Food ;
+                            dbo:region dbr:Tuscany .
+
+            FILTER(REGEX(STR(?risorsaDBpedia), ?nomeFrammento, "i"))
+
+            OPTIONAL {{
+                ?risorsaDBpedia dbo:description | dbo:abstract | rdfs:comment ?descrizione .
+                FILTER(LANG(?descrizione) = "it")
+            }}
+        }}
+    }}
+    """
+    return _run_full_select_simplificata(query)
+
+
+def get_media_piatti_ingredienti_dbpedia() -> List[Dict[str, Any]]:
+    """
+    Query federata 2: per ciascun Piatto locale e i suoi ingredienti
+    (individuati tramite qualunque proprietà il cui nome contenga
+    "ingrediente"/"Ingredient"), ricostruisce l'URI DBpedia corrispondente
+    e ne recupera, se disponibili, immagine (dbo:thumbnail) e link alla
+    voce Wikipedia (foaf:isPrimaryTopicOf), sia per il piatto sia per
+    l'ingrediente.
+    """
+    query = f"""
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX : <{BASE_NS}>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX dbo: <http://dbpedia.org/ontology/>
+    PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+
+    SELECT DISTINCT
+        ?piattoLocale ?risorsaDBpediaPiatto ?urlImmaginePiatto ?linkWikipediaPiatto
+        ?ingredienteLocale ?risorsaDBpediaIngrediente ?urlImmagineIngrediente ?linkWikipediaIngrediente
+    WHERE {{
+        ?piattoLocale a/rdfs:subClassOf* :Piatto .
+
+        ?piattoLocale ?proprietaIngrediente ?ingredienteLocale .
+        FILTER(CONTAINS(STR(?proprietaIngrediente), "ingrediente") || CONTAINS(STR(?proprietaIngrediente), "Ingredient"))
+
+        BIND(STRAFTER(STR(?piattoLocale), "Progetto-WebSem-EE/") AS ?nomePiattoFrammento)
+        BIND(STRAFTER(STR(?ingredienteLocale), "Progetto-WebSem-EE/") AS ?nomeIngredienteFrammento)
+
+        BIND(URI(CONCAT("http://dbpedia.org/resource/", ?nomePiattoFrammento)) AS ?risorsaDBpediaPiatto)
+        BIND(URI(CONCAT("http://dbpedia.org/resource/", ?nomeIngredienteFrammento)) AS ?risorsaDBpediaIngrediente)
+
+        SERVICE <https://dbpedia.org/sparql> {{
+            OPTIONAL {{
+                ?risorsaDBpediaPiatto rdf:type dbo:Food .
+                OPTIONAL {{ ?risorsaDBpediaPiatto dbo:thumbnail ?urlImmaginePiatto }}
+                OPTIONAL {{ ?risorsaDBpediaPiatto foaf:isPrimaryTopicOf ?linkWikipediaPiatto }}
+            }}
+            OPTIONAL {{
+                OPTIONAL {{ ?risorsaDBpediaIngrediente dbo:thumbnail ?urlImmagineIngrediente }}
+                OPTIONAL {{ ?risorsaDBpediaIngrediente foaf:isPrimaryTopicOf ?linkWikipediaIngrediente }}
+            }}
+        }}
+    }}
+    """
+    return _run_full_select_simplificata(query)
+
+
+def get_origine_geografica_piatti_dbpedia() -> List[Dict[str, Any]]:
+    """
+    Query federata 3: per ciascun Piatto locale, cerca su DBpedia una
+    risorsa dbo:Food il cui URI corrisponda (case-insensitive) al nome del
+    piatto, e ne recupera il luogo/regione/paese di origine (dbo:region o
+    dbo:country) con l'etichetta in italiano.
+    """
+    query = f"""
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX : <{BASE_NS}>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX dbo: <http://dbpedia.org/ontology/>
+
+    SELECT DISTINCT ?piattoLocale ?risorsaDBpedia ?luogoOrigine ?nomeLuogo WHERE {{
+        ?piattoLocale a/rdfs:subClassOf* :Piatto .
+
+        BIND(STRAFTER(STR(?piattoLocale), "Progetto-WebSem-EE/") AS ?nomeFrammento)
+
+        SERVICE <https://dbpedia.org/sparql> {{
+            ?risorsaDBpedia rdf:type dbo:Food .
+
+            ?risorsaDBpedia dbo:region | dbo:country ?luogoOrigine .
+
+            ?luogoOrigine rdfs:label ?nomeLuogo .
+            FILTER(LANG(?nomeLuogo) = "it")
+
+            FILTER(REGEX(STR(?risorsaDBpedia), ?nomeFrammento, "i"))
+        }}
+    }}
+    """
+    return _run_full_select_simplificata(query)
 
 
 # --------------------------------------------------------------------------

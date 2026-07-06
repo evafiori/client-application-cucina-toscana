@@ -14,6 +14,7 @@ L'interfaccia è organizzata in pagine (sidebar):
   - Esplora Ingredienti
   - Esplora Bevande
   - Menu e Territorio
+  - Dati Esterni (DBpedia) (query federate SERVICE)
   - Inserimento Dati (form di scrittura)
   - SPARQL Playground (query libere in sola lettura)
 """
@@ -34,6 +35,7 @@ PAGINE = [
     "Esplora Ingredienti",
     "Esplora Bevande",
     "Menu e Territorio",
+    "Dati Esterni (DBpedia)",
     "Inserimento Dati",
     "SPARQL Playground",
 ]
@@ -219,6 +221,58 @@ elif pagina == "Menu e Territorio":
         if zona != "-":
             prodotti = _safe(be.get_prodotti_tipici, zona)
             _df(prodotti, cols=["prodotto"])
+
+
+# --------------------------------------------------------------------------
+# PAGINA: DATI ESTERNI (DBPEDIA) - QUERY FEDERATE
+# --------------------------------------------------------------------------
+elif pagina == "Dati Esterni (DBpedia)":
+    st.header("Dati Esterni (DBpedia) — Query Federate")
+    st.caption(
+        "Le query di questa pagina usano la clausola SPARQL SERVICE: la parte "
+        "locale gira su GraphDB, la parte su DBpedia viene delegata da GraphDB "
+        "stesso a https://dbpedia.org/sparql. Richiedono che il repository "
+        "GraphDB abbia accesso di rete in uscita verso dbpedia.org e possono "
+        "impiegare qualche secondo in più delle query locali."
+    )
+
+    tab1, tab2, tab3 = st.tabs([
+        "Descrizioni dei piatti",
+        "Immagini e link Wikipedia",
+        "Origine geografica",
+    ])
+
+    with tab1:
+        st.subheader("Descrizione dei piatti toscani da DBpedia")
+        st.caption("Cerca su DBpedia una risorsa dbo:Food originaria della Toscana con nome simile al piatto locale.")
+        if st.button("Esegui query", key="btn_descrizione_dbpedia"):
+            with st.spinner("Interrogazione federata GraphDB → DBpedia in corso..."):
+                rows = _safe(be.get_descrizione_piatti_dbpedia)
+            _df(rows, cols=["piattoLocale", "risorsaDBpedia", "descrizione"])
+
+    with tab2:
+        st.subheader("Immagini e link Wikipedia di piatti e ingredienti")
+        st.caption("Ricostruisce l'URI DBpedia di piatto e ingredienti e ne recupera thumbnail e link a Wikipedia.")
+        if st.button("Esegui query", key="btn_media_dbpedia"):
+            with st.spinner("Interrogazione federata GraphDB → DBpedia in corso..."):
+                rows = _safe(be.get_media_piatti_ingredienti_dbpedia)
+            df = _df(rows, cols=[
+                "piattoLocale", "linkWikipediaPiatto", "urlImmaginePiatto",
+                "ingredienteLocale", "linkWikipediaIngrediente", "urlImmagineIngrediente",
+            ])
+            if df is not None and "urlImmaginePiatto" in df.columns:
+                for _, row in df.iterrows():
+                    url = row.get("urlImmaginePiatto")
+                    if isinstance(url, str) and url.startswith("http"):
+                        st.image(url, caption=row.get("piattoLocale"), width=200)
+
+    with tab3:
+        st.subheader("Origine geografica dei piatti secondo DBpedia")
+        st.caption("Recupera regione/paese di origine (in italiano) della risorsa DBpedia corrispondente al piatto locale.")
+        if st.button("Esegui query", key="btn_origine_dbpedia"):
+            with st.spinner("Interrogazione federata GraphDB → DBpedia in corso..."):
+                rows = _safe(be.get_origine_geografica_piatti_dbpedia)
+            _df(rows, cols=["piattoLocale", "risorsaDBpedia", "nomeLuogo"])
 
 
 # --------------------------------------------------------------------------
